@@ -1,0 +1,1 @@
+python scripts/find_best_results.py --results-dir results/cifar100 --output-dir results/cifar100
