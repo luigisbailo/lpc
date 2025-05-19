@@ -1,60 +1,58 @@
 import importlib
 import time
 import math
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import Subset
+from scipy.special import softmax
+import random
 
 from lpc.utils import (
     load_checkpoint,
     save_checkpoint,
     gather_dict_outputs_ddp,
 )
-
 from lpc.losses import (
     arcface_loss,
     cosface_loss,
     supervised_contrastive_loss,
 )
-
 from lpc.metrics import (
     get_entropy,
     get_coeff_var,
     get_distance_margins,
     get_binarity_metrics,
     get_collapse_metrics,
+    estimate_lipschitz_gradient_norm_stream, 
 )
-
 from lpc.deepfool import deepfool
 
 
 class Trainer:
-    """
-    Trainer for a neural network classifier.
+    """Trainer for a neural‑network classifier."""
 
-    Parameters:
-        network (torch.nn.Module): The network model.
-        architecture: Architecture details.
-        trainset (Dataset): Training dataset.
-        testset (Dataset): Testing dataset.
-        training_hypers (dict): Training hyperparameters.
-        architecture_type (str): Name/type of the architecture.
-        l2_loss (bool): Use L2 loss on penultimate activations.
-        cosface_loss (bool): Use CosFace loss.
-        arcface_loss (bool): Use ArcFace loss.
-        scl (bool): Use supervised contrastive loss.
-        store_penultimate (bool): Store penultimate activations.
-        verbose (bool): Print training progress.
-    """
-    def __init__(self, network, architecture, trainset, testset,
-                 training_hypers, architecture_type,
-                 l2_loss=False, cosface_loss=False, arcface_loss=False,
-                 scl=False, store_penultimate=False, verbose=True):
+    def __init__(
+        self,
+        network,
+        architecture,
+        trainset,
+        testset,
+        training_hypers,
+        architecture_type,
+        l2_loss=False,
+        cosface_loss=False,
+        arcface_loss=False,
+        scl=False,
+        store_penultimate=False,
+        verbose=True,
+    ):
         self.network = network
         self.architecture = architecture
         self.trainset = trainset
@@ -71,18 +69,12 @@ class Trainer:
         self.world_size = None
         self.distributed = False
 
-    def fit(self, checkpoint_file, rank, world_size, distributed):
-        """
-        Train the model.
+    # ---------------------------------------------------------------------
+    #  Public interface
+    # ---------------------------------------------------------------------
 
-        Args:
-            checkpoint_file (str): Path to a checkpoint file (if any).
-            rank (int): Process rank (for GPU and DDP).
-            world_size (int): Total number of processes.
-            distributed (bool): Whether using distributed training.
-        Returns:
-            dict: Aggregated training results (only on rank 0).
-        """
+    def fit(self, checkpoint_file, rank, world_size, distributed):
+        """Run training and return aggregated results (rank‑0 only)."""
         self.rank = rank
         self.world_size = world_size
         self.distributed = distributed
@@ -92,143 +84,185 @@ class Trainer:
         self._setup_optimizer()
 
         start_epoch, gamma, converged = self._load_checkpoint(checkpoint_file)
-        if start_epoch >= self.training_hypers['total_epochs']:
-            print('Last epoch already reached. Exiting')
-            exit(0)
+        if start_epoch >= self.training_hypers["total_epochs"]:
+            print("Last epoch already reached. Exiting")
+            return None
 
-        last_train_epoch = start_epoch + self.training_hypers['train_epochs']
+        last_train_epoch = start_epoch + self.training_hypers["train_epochs"]
 
-        self.train_sampler = DistributedSampler(self.trainset, num_replicas=world_size, rank=rank)
+        # data loader
+        num_workers = self.world_size * 4
+        self.train_sampler = DistributedSampler(
+            self.trainset, num_replicas=world_size, rank=rank
+        )
         trainloader = DataLoader(
             self.trainset,
-            batch_size=self.training_hypers['batch_size'],
+            batch_size=self.training_hypers["batch_size"],
             sampler=self.train_sampler,
-            num_workers=4,
+            num_workers=num_workers,
             pin_memory=True,
         )
 
+        # bookkeeping
         res_list = []
         epoch_training_time_list = []
-        start_training_time = time.time()  # Start overall training timer
+        start_training_time = time.time()
 
+        # convenient aliases for γ scheduling
+        sched_type = self.training_hypers.get("gamma_scheduler_type", "exponential")
+        gamma_min = self.training_hypers["gamma"]
+        gamma_max = 10 ** self.training_hypers["gamma_max_exp"]
+        T = self.training_hypers.get("gamma_scheduler_T", 1)
+        t0 = self.training_hypers.get("gamma_scheduler_init", 0)
+
+        # -----------------------------------------------------------------
+        #  Main epoch loop
+        # -----------------------------------------------------------------
         for epoch in range(start_epoch + 1, last_train_epoch + 1):
+            # update γ **before** the forward pass
+            if sched_type == "cosine":
+                if epoch >= t0:
+                    t = min(epoch - t0, T)
+                    alpha = 0.5 * (1 - math.cos(math.pi * t / T))
+                    gamma = gamma_min + (gamma_max - gamma_min) * alpha
+                else:
+                    gamma = gamma_min
+            elif sched_type == "linear":             
+                if epoch >= t0:
+                    t = min(epoch - t0, T)
+                    alpha = t / T
+                    gamma = gamma_min + (gamma_max - gamma_min) * alpha
+                else:
+                    gamma = gamma_min
+            else:  
+                if (
+                    epoch % self.training_hypers["gamma_scheduler_step"] == 0
+                    and gamma < gamma_max
+                    and epoch >= self.training_hypers["gamma_scheduler_init"]
+                ):
+                    gamma *= self.training_hypers["gamma_scheduler_factor"]
+
+            # training phase ------------------------------------------------
             self.train_sampler.set_epoch(epoch)
             epoch_time = self._train_epoch(epoch, trainloader, gamma)
             epoch_training_time_list.append(epoch_time)
 
-            if (epoch % self.training_hypers['gamma_scheduler_step'] == 0 and 
-                gamma < 10 ** self.training_hypers['gamma_max_exp'] and
-                epoch > self.training_hypers['gamma_scheduler_init']):
-                gamma *= self.training_hypers['gamma_scheduler_factor']
-
-            if epoch > self.training_hypers['lr_scheduler_start']:
+            # LR scheduler (unchanged) -------------------------------------
+            if epoch >= self.training_hypers["lr_scheduler_start"]:
                 self.scheduler.step()
-                self.opt.param_groups[1]['lr'] = self.training_hypers['lr']
+                self.opt.param_groups[1]["lr"] = self.training_hypers["lr"]
 
-            # Determine if this is the last epoch.
-            is_last_epoch = (epoch == last_train_epoch)
-            if epoch % self.training_hypers['logging'] == 0 or is_last_epoch:
+            # evaluation & logging every n epochs or at the very end --------
+            is_last_epoch = epoch == last_train_epoch
+            if is_last_epoch or epoch % self.training_hypers["logging"] == 0:
                 res_epoch = self._evaluate_and_log(epoch, gamma, is_last_epoch)
                 if res_epoch is not None:
                     res_list.append(res_epoch)
 
+        # -----------------------------------------------------------------
+        #  Wrap‑up
+        # -----------------------------------------------------------------
         elapsed_training_time = time.time() - start_training_time
-
         if self.rank == 0:
-            res_dict_stack = self._aggregate_results(res_list, elapsed_training_time, epoch_training_time_list, converged)
+            res_dict_stack = self._aggregate_results(
+                res_list, elapsed_training_time, epoch_training_time_list, converged
+            )
             if checkpoint_file:
                 self._save_checkpoint(checkpoint_file, epoch, gamma, converged)
             return res_dict_stack
-        else:
-            return None
+        return None
+
+    # ---------------------------------------------------------------------
+    #  Initialisation helpers
+    # ---------------------------------------------------------------------
 
     def _prepare_model(self):
-        """Move model to GPU and wrap with DDP if needed."""
+        """Put model on the current GPU and wrap in DDP if necessary."""
         self.model = self.network.to(self.rank)
-        if self.world_size > 1:
-            self.model_ddp = DDP(self.model, device_ids=[self.rank])
-        else:
-            self.model_ddp = self.model
+        self.model_ddp = (
+            DDP(self.model, device_ids=[self.rank]) if self.world_size > 1 else self.model
+        )
 
     def _setup_optimizer(self):
-        """Set up the optimizer and scheduler."""
+        """Create optimiser and its LR scheduler (cosine for learning‑rate)."""
         if self.world_size > 1:
             excluded_params = set(self.model_ddp.module.output_layer.parameters())
         else:
             excluded_params = set(self.model_ddp.output_layer.parameters())
 
-        other_params = [param for name, param in self.model_ddp.named_parameters() if param not in excluded_params]
-        excluded_params = list(excluded_params)
+        other_params = [p for p in self.model_ddp.parameters() if p not in excluded_params]
         params_to_update = [
-            {'params': other_params, 'lr': self.training_hypers['lr']},
-            {'params': excluded_params, 'lr': self.training_hypers['lr']}
+            {"params": other_params, "lr": self.training_hypers["lr"]},
+            {"params": list(excluded_params), "lr": self.training_hypers["lr"]},
         ]
         torch_optim_module = importlib.import_module("torch.optim")
-        self.opt = getattr(torch_optim_module, self.training_hypers['optimizer'])(
-            params_to_update,
-            weight_decay=self.training_hypers['weight_decay']
+        self.opt = getattr(torch_optim_module, self.training_hypers["optimizer"])(
+            params_to_update, weight_decay=self.training_hypers["weight_decay"]
         )
-        self.scheduler = StepLR(
+
+        start_schedule_epoch = self.training_hypers.get("lr_scheduler_start", 0)
+        total_epochs = self.training_hypers["total_epochs"]
+        T_max_epochs = max(1, total_epochs - start_schedule_epoch)
+        self.scheduler = CosineAnnealingLR(
             self.opt,
-            step_size=self.training_hypers['lr_scheduler_step_size'],
-            gamma=self.training_hypers['lr_scheduler_gamma']
+            T_max=T_max_epochs,
+            eta_min=self.training_hypers.get("lr_min", 0),
         )
+
+    # ---------------------------------------------------------------------
+    #  Check‑pointing
+    # ---------------------------------------------------------------------
 
     def _load_checkpoint(self, checkpoint_file):
         start_epoch = 0
-        gamma = self.training_hypers['gamma']
+        gamma = self.training_hypers["gamma"]
         converged = False
         checkpoint_loaded = False
 
         if self.rank == 0:
-            print(f"architecture name: {self.architecture_type}, l2_loss: {self.l2_loss}, "
-                  f"scl: {self.scl}, arcface: {self.arcface}, "
-                  f"cosface: {self.cosface}")
             try:
                 checkpoint = load_checkpoint(checkpoint_file)
-                self.model_ddp.load_state_dict(checkpoint['state_dict'])
-                self.opt.load_state_dict(checkpoint['optimizer'])
-                self.scheduler.load_state_dict(checkpoint['scheduler'])
-                start_epoch = checkpoint['epoch']
-                gamma = checkpoint['gamma']
-                converged = checkpoint.get('converged', False)
+                self.model_ddp.load_state_dict(checkpoint["state_dict"])
+                self.opt.load_state_dict(checkpoint["optimizer"])
+                self.scheduler.load_state_dict(checkpoint["scheduler"])
+                start_epoch = checkpoint["epoch"]
+                gamma = checkpoint["gamma"]
+                converged = checkpoint.get("converged", False)
                 checkpoint_loaded = True
                 print(f"Resuming from checkpoint at epoch {start_epoch}")
             except FileNotFoundError:
-                print("No checkpoint found, starting training from scratch")
+                print("No checkpoint found – starting from scratch")
 
         checkpoint_loaded_tensor = torch.tensor(checkpoint_loaded).to(self.rank)
         if self.distributed:
             dist.broadcast(checkpoint_loaded_tensor, src=0)
         if checkpoint_loaded_tensor.item():
-            state_dict_list = [
+            objs = [
                 self.model_ddp.state_dict(),
                 self.opt.state_dict(),
                 self.scheduler.state_dict(),
                 start_epoch,
                 gamma,
-                converged
+                converged,
             ]
             if self.distributed:
-                dist.broadcast_object_list(state_dict_list, src=0)
-            self.model_ddp.load_state_dict(state_dict_list[0])
-            self.opt.load_state_dict(state_dict_list[1])
-            self.scheduler.load_state_dict(state_dict_list[2])
-            start_epoch = state_dict_list[3]
-            gamma = state_dict_list[4]
-            converged = state_dict_list[5]
+                dist.broadcast_object_list(objs, src=0)
+            self.model_ddp.load_state_dict(objs[0])
+            self.opt.load_state_dict(objs[1])
+            self.scheduler.load_state_dict(objs[2])
+            start_epoch, gamma, converged = objs[3:6]
         return start_epoch, gamma, converged
 
     def _save_checkpoint(self, filename, epoch, gamma, converged):
         checkpoint = {
-            'epoch': epoch,
-            'gamma': gamma,
-            'state_dict': self.model_ddp.state_dict(),
-            'optimizer': self.opt.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
-            'converged': converged,
+            "epoch": epoch,
+            "gamma": gamma,
+            "state_dict": self.model_ddp.state_dict(),
+            "optimizer": self.opt.state_dict(),
+            "scheduler": self.scheduler.state_dict(),
+            "converged": converged,
         }
-        print('Checkpoint file:', filename)
+        print("Checkpoint file:", filename)
         save_checkpoint(checkpoint, filename)
 
     def _train_epoch(self, epoch, trainloader, gamma):
@@ -244,31 +278,23 @@ class Trainer:
             loss.backward()
             self.opt.step()
 
-        epoch_time = (time.time() - epoch_start) / 60  # in minutes
-        return epoch_time
+        return (time.time() - epoch_start) / 60  # minutes
 
     def _compute_loss(self, output_dict, y_batch, epoch, gamma):
-        x_output = output_dict['x_output']
-        x_penultimate = output_dict['x_penultimate']
-        x_backbone = output_dict['x_backbone']
+        x_output = output_dict["x_output"]
+        x_penultimate = output_dict["x_penultimate"]
+        x_backbone = output_dict["x_backbone"]
 
-        loss_classification = nn.CrossEntropyLoss()(x_output, y_batch).to(self.rank)
-        loss = loss_classification
+        loss = nn.CrossEntropyLoss()(x_output, y_batch).to(self.rank)
 
         if self.l2_loss:
-            loss_compression = nn.functional.mse_loss(
-                x_penultimate,
-                torch.zeros_like(x_penultimate),
-                reduction='mean'
-            )
-            loss = loss + loss_compression * gamma
+            loss += F.mse_loss(
+                x_penultimate, torch.zeros_like(x_penultimate), reduction="mean"
+            ) * gamma
 
         if self.scl:
-            if self.architecture_type == 'lin_pen' or self.architecture_type == 'nonlin_pen':
-                x = x_backbone
-            elif self.architecture_type == 'no_pen':
-                x = x_penultimate
-            loss += supervised_contrastive_loss(x, y_batch, device=self.rank)
+            x_for_scl = x_backbone if self.architecture_type in {"lin_pen", "nonlin_pen"} else x_penultimate
+            loss += supervised_contrastive_loss(x_for_scl, y_batch, device=self.rank)
 
         if self.arcface:
             scale = min(16.0 + (epoch - 1) * 1.0, 64.0)
@@ -293,25 +319,46 @@ class Trainer:
         return loss
 
     def _evaluate_and_log(self, epoch, gamma, is_last_epoch):
+        if self.distributed:
+            dist.barrier()
+        num_workers = self.world_size * 4
+
         res_epoch = {}
         eval_trainloader = DataLoader(
             self.trainset,
-            batch_size=4 * self.training_hypers['batch_size'],
+            batch_size=self.training_hypers['batch_size'],
             sampler=self.train_sampler,
-            num_workers=4,
+            num_workers=num_workers,
             pin_memory=True,
         )
         eval_train = self.eval(eval_trainloader, self.rank)
+
+        # Add debug info
+        if self.rank == 0:
+            print(f"Rank {self.rank}: eval_train keys: {list(eval_train.keys())}")
+            for key, val in eval_train.items():
+                if isinstance(val, np.ndarray):
+                    print(f"Rank {self.rank}: {key} shape: {val.shape}, contains_nan: {np.isnan(val).any()}")
+
         if self.distributed:
-            gathered_eval_train = gather_dict_outputs_ddp(eval_train, self.rank, self.world_size)
+            # Synchronize before gathering data
+            dist.barrier()
+            print(f"Rank {self.rank}: Before gathering")
+            try:
+                gathered_eval_train = gather_dict_outputs_ddp(eval_train, self.rank, self.world_size)
+                print(f"Rank {self.rank}: After gathering")
+            except Exception as e:
+                print(f"Rank {self.rank}: Exception during gathering: {e}")
+                gathered_eval_train = eval_train if self.rank == 0 else None
+            # Ensure all processes wait after gathering
+            dist.barrier()
         else:
             gathered_eval_train = eval_train
-
         if self.rank == 0:
             eval_testloader = DataLoader(
                 self.testset,
-                batch_size=4 * self.training_hypers['batch_size'],
-                num_workers=4,
+                batch_size= self.training_hypers['batch_size'],
+                num_workers=num_workers,
                 pin_memory=True,
             )
             eval_test = self.eval(eval_testloader, self.rank)
@@ -352,6 +399,27 @@ class Trainer:
 
             # Compute DeepFool score and entropy only on the last epoch.
             if is_last_epoch:
+               
+                start_time = time.time()
+                subsample_size = 1000
+                test_indices = random.sample(range(len(self.testset)), min(subsample_size, len(self.testset)))
+                subsampled_testset = Subset(self.testset, test_indices)
+                train_indices = random.sample(range(len(self.trainset)), min(subsample_size, len(self.trainset)))
+                subsampled_trainset = Subset(self.trainset, train_indices)
+
+                loader_test = DataLoader(subsampled_testset, batch_size=self.training_hypers['batch_size'], shuffle=True)
+                loader_train = DataLoader(subsampled_trainset, batch_size=self.training_hypers['batch_size'], shuffle=True)
+
+                model_to_eval = self.model # Or self.model_ddp.module if still using DDP context
+                res_epoch['lipschitz_estimation_train'] = estimate_lipschitz_gradient_norm_stream(
+                    model_to_eval, loader_train, device=self.rank
+                )
+                res_epoch['lipschitz_estimation_test'] = estimate_lipschitz_gradient_norm_stream(
+                    model_to_eval, loader_test, device=self.rank
+                )
+                print(f"Elapsed time to compute Lipschitz estimation: {(time.time() - start_time)/60:.2f} minutes")
+
+                
                 start_time = time.time()
                 batch_size_deepfool = 1000
                 loader = DataLoader(self.testset, batch_size=batch_size_deepfool, shuffle=True)
@@ -369,11 +437,15 @@ class Trainer:
                 res_epoch['entropy_train'] = get_entropy(gathered_eval_train, k=20, normalize=True)
                 res_epoch['entropy_test'] = get_entropy(eval_test, k=20, normalize=True)
                 print(f"Elapsed time to compute entropy: {(time.time()-start_time)/60:.2f} minutes")
+                  
             else:
                 res_epoch['deepfool_score'] = None
                 res_epoch['entropy_train'] = None
                 res_epoch['entropy_test'] = None
+                res_epoch['lipschitz_estimation_train'] = None
+                res_epoch['lipschitz_estimation_test']  = None
 
+                
             if res_epoch['accuracy_train'] > self.training_hypers['convergence_thres'] and not getattr(self, 'converged', False):
                 self.converged = True
                 self.convergence_epoch = epoch
@@ -390,9 +462,10 @@ class Trainer:
                 self.penultimate_train = gathered_eval_train['x_penultimate']
                 self.penultimate_test = eval_test['x_penultimate']
 
-            return res_epoch
-        else:
-            return None
+        if self.distributed:
+            dist.barrier()
+
+        return res_epoch if self.rank == 0 else None
 
     def _aggregate_results(self, res_list, total_training_time, epoch_times, converged):
         res_dict_stack = {}
@@ -419,8 +492,11 @@ class Trainer:
             res_dict_stack['accuracy_test_converged'] = False
             res_dict_stack['convergence_epoch'] = False
 
+        res_dict_stack['deepfool_score'] = res_list[-1].get('deepfool_score', 0)
         res_dict_stack['entropy_train'] = res_list[-1].get('entropy_train', 0)
         res_dict_stack['entropy_test'] = res_list[-1].get('entropy_test', 0)
+        res_dict_stack['lipschitz_estimation_train'] = res_list[-1].get('lipschitz_estimation_train', 0)
+        res_dict_stack['lipschitz_estimation_test'] = res_list[-1].get('lipschitz_estimation_test', 0)
 
         if self.store_penultimate and hasattr(self, 'penultimate_train'):
             res_dict_stack['penultimate_train'] = self.penultimate_train.reshape(1, self.penultimate_train.shape[0], -1)
@@ -431,11 +507,9 @@ class Trainer:
     def eval(self, loader, device):
         evaluations = {}
         self.model_ddp.eval()
-
         x_output_list = []
         x_penultimate_list = []
         y_label_list = []
-        x_input_list = []
 
         with torch.no_grad():
             for x_input_batch, y_label_batch in loader:
@@ -446,29 +520,34 @@ class Trainer:
                 x_output_batch = output_dict_batch['x_output']
                 x_penultimate_batch = output_dict_batch['x_penultimate']
 
-                x_input_list.append(x_input_batch)
-                x_output_list.append(x_output_batch)
-                x_penultimate_list.append(x_penultimate_batch)
-                y_label_list.append(y_label_batch)
+                x_output_list.append(x_output_batch.cpu().numpy())
+                x_penultimate_list.append(x_penultimate_batch.cpu().numpy())
+                y_label_list.append(y_label_batch.cpu().numpy())
 
-            x_input = torch.cat(x_input_list, dim=0)
-            x_output = torch.cat(x_output_list, dim=0)
-            x_penultimate = torch.cat(x_penultimate_list, dim=0)
-            y_label = torch.cat(y_label_list, dim=0)
+                torch.cuda.empty_cache()
 
-            probs = torch.softmax(x_output, dim=-1)
-            y_predicted = torch.argmax(probs, dim=1)
-            top1_correct = (y_predicted == y_label).sum().item()
-            top1_accuracy = top1_correct / y_label.size(0)
-            top5_values, top5_indices = torch.topk(probs, k=5, dim=1)
-            top5_correct = (top5_indices == y_label.unsqueeze(1)).any(dim=1).sum().item()
-            top5_accuracy = top5_correct / y_label.size(0)
+            x_output = np.concatenate(x_output_list, axis=0)
+            x_penultimate = np.concatenate(x_penultimate_list, axis=0)
+            y_label = np.concatenate(y_label_list, axis=0)
+
+            probs = softmax(x_output, axis=1)  
+            y_predicted = np.argmax(probs, axis=1)
+
+            top1_correct = np.sum(y_predicted == y_label)
+            top1_accuracy = top1_correct / y_label.shape[0]
+
+            top5_indices = np.argsort(probs, axis=1)[:, -5:]  
+            top5_correct = 0
+            for i, label in enumerate(y_label):
+                if label in top5_indices[i]:
+                    top5_correct += 1
+            top5_accuracy = top5_correct / y_label.shape[0]
 
         evaluations.update({
-            'x_output': x_output.cpu().numpy(),
-            'x_penultimate': x_penultimate.cpu().numpy(),
-            'y_predicted': y_predicted.cpu().numpy(),
-            'y_label': y_label.cpu().numpy(),
+            'x_output': x_output,
+            'x_penultimate': x_penultimate,
+            'y_predicted': y_predicted,
+            'y_label': y_label,
             'top1_accuracy': top1_accuracy,
             'top5_accuracy': top5_accuracy,
         })
