@@ -8,25 +8,26 @@ architecture:
         nodes_head: []
         penultimate_nodes: 64
         penultimate_nodes_wide: 128
-        penultimate_nodes_narrow: 16
+        penultimate_nodes_narrow: 32
         activation: SiLU
         
-
 
 training:
     hypers:
         batch_size: 128
-        train_epochs: 800
-        total_epochs: 800
+        train_epochs: 1500
+        total_epochs: 1500
         logging: 50
-        gamma: 0.01
-        gamma_scheduler_factor: 1.05
-        gamma_scheduler_step: 1
-        gamma_scheduler_init: 1
+        gamma_scheduler_factor: 1.5
+        gamma_scheduler_step: 5
+        gamma_scheduler_type: exponential
+        gamma_scheduler_init: 1 
+        gamma: 0.0001
         gamma_max_exp: 6
-        lr_scheduler_step_size: 50
-        lr_scheduler_gamma: 0.5
-        lr_scheduler_start: 250
+        lr_scheduler_step_size: 1
+        lr_scheduler_gamma: 0
+        lr_scheduler_start: 300
+        lr_min: 0.00000001
         optimizer: AdamW
         weight_decay: 0.0005
         convergence_thres: 0.999
