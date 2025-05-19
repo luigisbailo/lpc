@@ -1,10 +1,10 @@
 # Latent Point Collapse  on a Low Dimensional Embedding in Deep Neural Network Classifiers
 
 ### Abstract
-The configuration of latent representations plays a critical role in determining the performance of deep neural network classifiers. In particular, the emergence of well-separated class embeddings in the latent space has been shown to improve both generalization and robustness. In this paper, we propose a method to induce the collapse of latent representations belonging to the same class into a single point, which enhances class separability in the latent space while enforcing Lipschitz continuity in the network.
-We demonstrate that this phenomenon, which we call \textit{latent point collapse}, is achieved by adding a strong $L_2$ penalty on the penultimate-layer representations and is the result of a push-pull tension developed with the cross-entropy loss function.
+The topological properties of latent representations play a critical role in determining the performance of deep neural network classifiers. In particular, the emergence of well-separated class embeddings in the latent space has been shown to improve both generalization and robustness. In this paper, we propose a method to induce the collapse of latent representations belonging to the same class into a single point, which enhances class separability in the latent space while making the network Lipschitz continuous.
+We demonstrate that this phenomenon, which we call \textit{latent point collapse} (LPC), is achieved by adding a strong $L_2$ penalty on the penultimate-layer representations and is the result of a push-pull tension developed with the cross-entropy loss function.
 In addition, we show the practical utility of applying this compressing loss term to the latent representations of a low-dimensional linear penultimate layer.
-The proposed approach is straightforward to implement and yields substantial improvements in discriminative feature embeddings, along with remarkable gains in robustness to input perturbations.
+LPC can be viewed as a stronger manifestation of \textit{neural collapse} (NC): while NC entails that within-class representations converge around their class means, LPC causes these representations to collapse in absolute value to a single point. As a result, the network improvements typically associated with NC—namely better generalization and robustness—are even more pronounced when LPC develops.
 
 ### Dependencies
 - Python 3.10  
