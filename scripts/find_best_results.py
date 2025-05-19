@@ -135,7 +135,6 @@ def main():
         "lpc_no_pen",
         "no_pen",
         "scl_no_pen",
-        "cosface_no_pen",
         "arcface_no_pen",
         "lin_pen",
         "nonlin_pen",

@@ -181,8 +181,6 @@ def build_filename(base_name: str, flags: Dict[str, bool], penultimate_prefix: s
         name_parts.append("scl")
     if flags.get('arcface'):
         name_parts.append("arcface")
-    if flags.get('cosface'):
-        name_parts.append("cosface")
     if flags.get('l2_loss'):
         name_parts.append("lpc")
 
@@ -243,7 +241,6 @@ def main_worker(args: argparse.Namespace) -> None:
     flags = {
         'l2_loss': parse_bool_arg(args.l2_loss, "l2 loss"),
         'scl': parse_bool_arg(args.scl, "scl"),
-        'cosface': parse_bool_arg(args.cosface, "cosface"),
         'arcface': parse_bool_arg(args.arcface, "arcface"),
     }
     store_penultimate = parse_bool_arg(args.store_penultimate, "store penultimate")
@@ -310,7 +307,6 @@ def main_worker(args: argparse.Namespace) -> None:
             architecture_type=args.architecture_type,
             l2_loss=flags.get('l2_loss'),
             arcface_loss=flags.get('arcface'),
-            cosface_loss=flags.get('cosface'),
             scl=flags.get('scl'),
             store_penultimate=store_penultimate,
             verbose=True
@@ -342,7 +338,6 @@ def main() -> None:
     parser.add_argument('--sample', required=False)
     parser.add_argument('--lr', required=False)
     parser.add_argument('--l2-loss', required=False)
-    parser.add_argument('--cosface', required=False)
     parser.add_argument('--arcface', required=False)
     parser.add_argument('--scl', required=False)
     parser.add_argument('--store-penultimate', required=False)

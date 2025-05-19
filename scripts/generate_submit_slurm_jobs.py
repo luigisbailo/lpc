@@ -98,7 +98,6 @@ def submit_slurm_jobs(template: str, config: str, id_name: str, dataset_dir: str
         ("no_pen", f"{script_path / 'main.py'} --architecture-type no_pen"),
         ("no_pen_scl", f"{script_path / 'main.py'} --architecture-type no_pen --scl True"),
         ("no_pen_arcface", f"{script_path / 'main.py'} --architecture-type no_pen --arcface True"),
-        ("no_pen_cosface", f"{script_path / 'main.py'} --architecture-type no_pen --cosface True"),
         ("lin_pen", f"{script_path / 'main.py'} --architecture-type lin_pen"),
         ("nonlin_pen", f"{script_path / 'main.py'} --architecture-type nonlin_pen")
     ]

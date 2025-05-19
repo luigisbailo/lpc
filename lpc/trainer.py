@@ -21,7 +21,6 @@ from lpc.utils import (
 )
 from lpc.losses import (
     arcface_loss,
-    cosface_loss,
     supervised_contrastive_loss,
 )
 from lpc.metrics import (
@@ -47,7 +46,6 @@ class Trainer:
         training_hypers,
         architecture_type,
         l2_loss=False,
-        cosface_loss=False,
         arcface_loss=False,
         scl=False,
         store_penultimate=False,
@@ -60,7 +58,6 @@ class Trainer:
         self.training_hypers = training_hypers
         self.architecture_type = architecture_type
         self.l2_loss = l2_loss
-        self.cosface = cosface_loss
         self.arcface = arcface_loss
         self.scl = scl
         self.store_penultimate = store_penultimate
@@ -306,14 +303,6 @@ class Trainer:
                 device=self.rank,
                 margin=margin,
                 scale=scale,
-            )
-
-        if self.cosface:
-            loss = cosface_loss(
-                features=x_penultimate,
-                labels=y_batch,
-                weight=self.model_ddp.output_layer.weight,
-                device=self.rank,
             )
 
         return loss
