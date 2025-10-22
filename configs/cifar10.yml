@@ -15,18 +15,22 @@ architecture:
 training:
     hypers:
         batch_size: 128
-        train_epochs: 1500
-        total_epochs: 1500
+        train_epochs: 1000
+        total_epochs: 1000
         logging: 50
-        gamma_scheduler_factor: 1.5
-        gamma_scheduler_step: 5
+        gamma_scheduler_factor_1: 2
+        gamma_scheduler_step_1: 5
+        gamma_max_exp_1: 3
+        gamma_scheduler_factor_2: 1.25
+        gamma_scheduler_step_2: 5
+        gamma_max_exp_2: 6
         gamma_scheduler_type: exponential
         gamma_scheduler_init: 1 
         gamma: 0.0001
         gamma_max_exp: 6
         lr_scheduler_step_size: 1
         lr_scheduler_gamma: 0
-        lr_scheduler_start: 300
+        lr_scheduler_start: 200
         lr_min: 0.00000001
         optimizer: AdamW
         weight_decay: 0.0005

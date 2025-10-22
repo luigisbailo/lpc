@@ -4,7 +4,6 @@ datasets
 jobs_output
 jobs_outputs
 results
-notebooks
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -1,9 +1,9 @@
 dataset:
-    name: CIFAR100
+    name: CIFAR10
 
 architecture:
     backbone: ResNet
-    backbone_model: 50
+    backbone_model: 18
     hypers:
         nodes_head: []
         penultimate_nodes: 64
@@ -23,11 +23,12 @@ training:
         gamma_max_exp_1: 3
         gamma_scheduler_factor_2: 1.25
         gamma_scheduler_step_2: 5
-        gamma_max_exp_2: 6
+        gamma_max_exp_2: 5
         gamma_scheduler_type: exponential
-        gamma_scheduler_init: 1 
+        gamma_scheduler_init: 1
         gamma: 0.0001
-        gamma_max_exp: 6
+        gamma_max_coeff_1: 1.0
+        gamma_max_coeff_2: 8.0
         lr_scheduler_step_size: 1
         lr_scheduler_gamma: 0
         lr_scheduler_start: 200

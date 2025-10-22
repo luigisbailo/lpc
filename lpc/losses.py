@@ -48,22 +48,3 @@ def arcface_loss(features, labels, weight, device, margin = 0.3, scale = 32.0):
     margin_logits = torch.where(one_hot == 1, phi, cosine) * scale
     loss = F.cross_entropy(margin_logits, labels)
     return loss
-
-
-def cosface_loss(features, labels, weight, device, margin = 0.25, scale = 32.0):
-    """
-    Computes CosFace loss as in:
-    "CosFace: Large Margin Cosine Loss for Deep Face Recognition" (Wang et al.).
-    """
-    if margin > 1.0:
-        raise ValueError("Margin should be less than or equal to 1.0")
-    x_norm = F.normalize(features, p=2, dim=1, eps=1e-7)
-    w_norm = F.normalize(weight, p=2, dim=1, eps=1e-7)
-    logits = torch.matmul(x_norm, w_norm.t())
-    batch_indices = torch.arange(features.size(0), dtype=torch.long, device=device)
-    logits[batch_indices, labels] -= margin
-    logits = logits.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-    margin_logits = logits * scale
-    loss = F.cross_entropy(margin_logits, labels)
-    return loss
-

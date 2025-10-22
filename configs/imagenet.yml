@@ -1,0 +1,37 @@
+dataset:
+    name: ImageNet
+
+architecture:
+    backbone: WideResNet
+    backbone_model: 50-2
+    hypers:
+        nodes_head: []
+        penultimate_nodes: 128
+        activation: SiLU
+
+
+training:
+    hypers:
+        batch_size: 64
+        gradient_accumulation_steps: 1
+        train_epochs: 10
+        total_epochs: 200
+        logging: 10
+        epochs_accuracy: 1
+        gamma_scheduler_factor_1: 2
+        gamma_scheduler_step_1: 1
+        gamma_max_exp_1: 3
+        gamma_scheduler_factor_2: 1.25
+        gamma_scheduler_step_2: 1
+        gamma_max_exp_2: 6
+        gamma_scheduler_init: 1
+        gamma: 0.0001
+        lr_scheduler_step_size: 1
+        lr_scheduler_gamma: 0
+        lr_scheduler_start: 70
+        lr_min: 0.0000001
+        warmup_factor: 0.1
+        warmup_begin: 0
+        warmup_end: 5
+        optimizer: AdamW
+        weight_decay: 0.0000001

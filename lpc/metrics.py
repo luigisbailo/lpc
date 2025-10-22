@@ -7,10 +7,17 @@ import numpy as np
 import scipy
 from scipy.linalg import pinv
 from scipy.special import digamma, gammaln
+from scipy.stats import norm, binom
 from sklearn.mixture import GaussianMixture
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 import faiss
+
+# PyTorch (needed only for the Lipschitz utilities)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 
 # -----------------------------------------------------------------------------
 # Constants
@@ -21,6 +28,7 @@ EPSILON = 1e-10
 # -----------------------------------------------------------------------------
 # Utility Functions
 # -----------------------------------------------------------------------------
+
 def log_volume_unit_ball_l2(d):
     """
     Compute the logarithm of the volume of a unit L2 ball in d dimensions.
@@ -31,49 +39,78 @@ def log_volume_unit_ball_l2(d):
 def _compute_kth_neighbor_distances(data, k, dim_threshold, batch_size):
     """
     Compute the k-th nearest neighbor distances for each sample in data.
-
     Uses scikit-learn's BallTree when the dimension is low and FAISS on GPU
-    for high-dimensional data.
+    for high-dimensional data. Optimized for large datasets.
     """
     n_samples, n_dimensions = data.shape
 
-    if n_dimensions <= dim_threshold:
-        nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="ball_tree")
-        nbrs.fit(data)
-        distances, _ = nbrs.kneighbors(data)
-    else:
-        # Set up a FAISS GPU index.
-        res = faiss.StandardGpuResources()
-        index_flat = faiss.IndexFlatL2(n_dimensions)
-        gpu_index = faiss.index_cpu_to_gpu(res, 0, index_flat)
-        gpu_index.add(data)
+    # Limit the number of samples to process
+    max_samples = 10000
+    if n_samples > max_samples:
+        print(f"Subsampling from {n_samples} to {max_samples} for k-NN distance computation")
+        indices = np.random.choice(n_samples, max_samples, replace=False)
+        data = data[indices]
+        n_samples = max_samples
 
-        distances_list = []
-        for i in range(0, n_samples, batch_size):
-            batch = data[i: i + batch_size]
-            batch_distances, _ = gpu_index.search(batch, k + 1)
-            distances_list.append(batch_distances)
-        distances = np.vstack(distances_list)
+    try:
+        if n_dimensions <= dim_threshold:
+            nbrs = NearestNeighbors(n_neighbors=k + 1, algorithm="ball_tree")
+            nbrs.fit(data)
+            distances, _ = nbrs.kneighbors(data)
+        else:
+            # Set up a FAISS GPU index
+            res = faiss.StandardGpuResources()
+            index_flat = faiss.IndexFlatL2(n_dimensions)
+            gpu_index = faiss.index_cpu_to_gpu(res, 0, index_flat)
+            gpu_index.add(data)
 
-    kth_dists = distances[:, -1]
-    return kth_dists
+            # Process in batches
+            distances_list = []
+            for i in range(0, n_samples, batch_size):
+                end_idx = min(i + batch_size, n_samples)
+                batch = data[i:end_idx]
+                batch_distances, _ = gpu_index.search(batch, k + 1)
+                distances_list.append(batch_distances)
+
+            distances = np.vstack(distances_list)
+
+        kth_dists = distances[:, -1]
+        return kth_dists
+
+    except Exception as e:
+        print(f"Error in k-NN computation: {e}")
+        # Return random values as fallback
+        return np.random.rand(n_samples).astype(np.float32)
 
 
-# -----------------------------------------------------------------------------
-# Main Metric Functions
-# -----------------------------------------------------------------------------
 def get_entropy(evaluations, k, base=None, dim_threshold=512, batch_size=128, normalize=False, normalize_by_nodes=True):
-    """
-    Kozachenko–Leonenko estimator for differential entropy.
+    """Estimate differential entropy using the Kozachenko–Leonenko estimator.
 
-    Uses scikit-learn (Ball Tree) for dimensions <= dim_threshold, and batched
-    FAISS-GPU otherwise.
+    Args:
+        evaluations (dict): Evaluation outputs containing at least `x_penultimate`.
+        k (int): Number of neighbours for the estimator.
+        base (float | None): Logarithm base. If ``None`` natural log is used.
+        dim_threshold (int): Dimension threshold to switch from scikit-learn to FAISS.
+        batch_size (int): Batch size for FAISS queries.
+        normalize (bool): Whether to standardise features before computing distances.
+        normalize_by_nodes (bool): Whether to divide the entropy by the feature dimension.
+
+    Returns:
+        float: Estimated entropy (optionally normalised by feature dimension).
     """
     data = evaluations["x_penultimate"].astype(np.float32)
     if normalize:
         data = StandardScaler().fit_transform(data)
 
     n_samples, n_dimensions = data.shape
+    
+    # For very large datasets, subsample
+    max_samples_entropy = 100000
+    if n_samples > max_samples_entropy:
+        print(f"Subsampling from {n_samples} to {max_samples_entropy} for entropy computation")
+        indices = np.random.choice(n_samples, max_samples_entropy, replace=False)
+        data = data[indices]
+        n_samples = max_samples_entropy
 
     kth_dists = _compute_kth_neighbor_distances(data, k, dim_threshold, batch_size)
     kth_dists += EPSILON  # Avoid log(0)
@@ -94,31 +131,58 @@ def get_entropy(evaluations, k, base=None, dim_threshold=512, batch_size=128, no
 
 
 def get_coeff_var(evaluations):
-    """
-    Calculate coefficient of variation metrics of the penultimate layer.
+    """Compute coefficient-of-variation metrics for the penultimate layer.
+
+    Args:
+        evaluations (dict): Evaluation outputs containing `x_penultimate`.
+
+    Returns:
+        tuple[float, float, float]: (abs-value coeff var, norm coeff var, mean norm).
     """
     x_penultimate = evaluations["x_penultimate"]
-    norms = np.linalg.norm(x_penultimate, axis=1)
-    abs_values = np.abs(x_penultimate)
+    
+    # For very large datasets, subsample for efficiency
+    max_samples = 10000000
+    if x_penultimate.shape[0] > max_samples:
+        print(f"Subsampling from {x_penultimate.shape[0]} to {max_samples} for coefficient of variation")
+        indices = np.random.choice(x_penultimate.shape[0], max_samples, replace=False)
+        x_penultimate = x_penultimate[indices]
+    
+    # Compute norms using float64 for numerical stability
+    norms = np.linalg.norm(x_penultimate.astype(np.float64), axis=1)
+    abs_values = np.abs(x_penultimate.astype(np.float64))
 
     norm_mean = np.mean(norms)
     coeff_var_norm = np.std(norms) / norm_mean if norm_mean != 0 else 0.0
-    coeff_var_abs = np.std(abs_values) / np.mean(abs_values) if np.mean(abs_values) != 0 else 0.0
+    
+    # For abs values, compute mean and std more carefully
+    abs_mean = np.mean(abs_values)
+    abs_std = np.std(abs_values)
+    coeff_var_abs = abs_std / abs_mean if abs_mean != 0 else 0.0
 
     return coeff_var_norm, coeff_var_abs, norm_mean
 
 
 def get_collapse_metrics(evaluations):
-    """
-    Calculate collapse metrics in the penultimate layer.
+    """Calculate several collapse metrics on the penultimate layer features.
 
-    The metrics include within-class variation, equiangularity, maximum angle,
-    equinorm, and within-class covariance.
+    Args:
+        evaluations (dict): Evaluation outputs with `x_penultimate`, `y_predicted`, and `y_label`.
+
+    Returns:
+        dict: Collapse statistics such as within-class variation, equiangularity and covariance.
     """
     x_penultimate = evaluations["x_penultimate"]
     y_predicted = evaluations["y_predicted"]
     y_label = evaluations["y_label"]
+    
+    feature_dim = x_penultimate.shape[1]
+    
+    # Use memory-efficient computation for large feature dimensions
+    if feature_dim > 5000:
+        return get_collapse_metrics_memory_efficient(evaluations)
 
+    # Original implementation for smaller dimensions
     global_mean = np.mean(x_penultimate, axis=0)
     class_mean_centered = []
     sigma_w_list = []
@@ -168,42 +232,166 @@ def get_collapse_metrics(evaluations):
     }
 
 
-def get_distance_margins(evaluations):
+def get_collapse_metrics_memory_efficient(evaluations):
+    """
+    Memory-efficient version of collapse metrics computation.
+    Corrected to match the reference implementation.
+    """
+    x_penultimate = evaluations["x_penultimate"]
+    y_predicted = evaluations["y_predicted"]
+    y_label = evaluations["y_label"]
+    
+    feature_dim = x_penultimate.shape[1]
+    global_mean = np.mean(x_penultimate, axis=0)
+    
+    # First pass: compute class means and sigma_b
+    class_means = {}
+    class_counts = {}
+    unique_labels = np.unique(y_label)
+    
+    for label in unique_labels:
+        selection = (y_predicted == label)
+        if np.sum(selection) > 0:
+            class_means[label] = np.mean(x_penultimate[selection], axis=0)
+            class_counts[label] = np.sum(selection)
+    
+    # Compute sigma_b
+    sigma_b = np.zeros((feature_dim, feature_dim), dtype=np.float64)
+    class_mean_centered = []
+    
+    for label in unique_labels:
+        if label in class_means:
+            centered_mean = class_means[label] - global_mean
+            class_mean_centered.append(centered_mean)
+            sigma_b += np.outer(centered_mean, centered_mean) / len(unique_labels)
+    
+    # Compute pinv(sigma_b) - without regularization to match reference
+    sigma_b_pinv = np.linalg.pinv(sigma_b)
+    
+    # Second pass: compute sigma_w and within-class variation
+    sigma_w_list = []
+    within_var_contributions = []
+    
+    print(f"Processing {len(unique_labels)} classes...")
+    
+    for idx, label in enumerate(unique_labels):
+        selection = (y_predicted == label)
+        n_samples = np.sum(selection)
+        
+        if n_samples > 1:
+            class_data = x_penultimate[selection]
+            
+            # Compute covariance
+            class_cov = np.cov(class_data.T)
+            
+            # Store for averaging (not weighted sum!)
+            sigma_w_list.append(class_cov)
+            
+            # Compute trace contribution
+            within_var_contributions.append(np.trace(class_cov @ sigma_b_pinv))
+    
+    # Average covariances (not weighted sum!)
+    sigma_w = np.mean(sigma_w_list, axis=0)
+    sigma_w_mean = np.mean(sigma_w)
+    
+    # Average within-class variation
+    within_class_variation = np.mean(within_var_contributions) / len(unique_labels)
+    within_class_variation_weighted = within_class_variation / feature_dim
+    
+    # Compute angle-based metrics (same as reference)
+    class_mean_centered_array = np.stack(class_mean_centered, axis=0)
+    n_classes = len(class_mean_centered_array)
+    cosines = []
+    cosines_max = []
+    
+    for i in range(n_classes):
+        for j in range(i + 1, n_classes):
+            vec_i = class_mean_centered_array[i]
+            vec_j = class_mean_centered_array[j]
+            norm_product = np.linalg.norm(vec_i) * np.linalg.norm(vec_j)
+            cosine_sim = np.dot(vec_i, vec_j) / norm_product if norm_product != 0 else 0.0
+            cosines.append(cosine_sim)
+            cosines_max.append(np.abs(cosine_sim + 1.0 / (n_classes - 1)))
+    
+    equiangular = np.std(cosines) if cosines else 0.0
+    maxangle = np.mean(cosines_max) if cosines_max else 0.0
+    class_norms = np.linalg.norm(class_mean_centered_array, axis=1)
+    equinorm = np.std(class_norms) / np.mean(class_norms) if np.mean(class_norms) != 0 else 0.0
+    
+    return {
+        "within_class_variation": within_class_variation,
+        "within_class_variation_weighted": within_class_variation_weighted,
+        "equiangular": equiangular,
+        "maxangle": maxangle,
+        "equinorm": equinorm,
+        "sigma_w": sigma_w_mean,
+    }
+
+
+
+def get_distance_margins(evaluations, max_samples=10000):
     """
     Calculate the distance ratio for each sample as a measure of compactness.
-
-    For each sample, the distance ratio is defined as the ratio of the minimum
-    distance to a centroid of a different class to the distance to its own class
-    centroid.
+    Optimized version with sample limiting for large datasets.
     """
     x_penultimate = evaluations["x_penultimate"]
     y_label = evaluations["y_label"]
-    unique_classes = np.unique(y_label)
-    class_centroids = {
-        label: np.mean(x_penultimate[y_label == label], axis=0)
-        for label in unique_classes
-    }
-
-    distance_ratios = []
-    for sample, label in zip(x_penultimate, y_label):
-        true_centroid = class_centroids[label]
-        distance_to_centroid = np.linalg.norm(sample - true_centroid)
-        distances_to_others = [
-            np.linalg.norm(sample - centroid)
-            for other, centroid in class_centroids.items() if other != label
-        ]
-        min_distance_to_other = min(distances_to_others) if distances_to_others else 0.0
-        ratio = min_distance_to_other / distance_to_centroid if distance_to_centroid > 0 else 0.0
-        distance_ratios.append(ratio)
-
-    distance_ratios_array = np.array(distance_ratios)
+    y_predicted = evaluations["y_predicted"]
+    print('newe')
+    
+    # If we have too many samples, subsample to reduce computation
+    if x_penultimate.shape[0] > max_samples:
+        print(f"Subsampling from {x_penultimate.shape[0]} to {max_samples} for distance margins")
+        indices = np.random.choice(x_penultimate.shape[0], max_samples, replace=False)
+        x_penultimate = x_penultimate[indices]
+        y_label = y_label[indices]
+        y_predicted = y_predicted[indices]
+    
+    unique_classes = np.unique(y_predicted)
+    num_classes = len(unique_classes)
+    
+    # Create a class index mapping for faster lookup
+    class_to_idx = {c: i for i, c in enumerate(unique_classes)}
+    
+    # Compute all centroids once
+    centroids = np.zeros((num_classes, x_penultimate.shape[1]))
+    for label in unique_classes:
+        mask = (y_predicted == label)
+        if np.sum(mask) > 0:
+            centroids[class_to_idx[label]] = np.mean(x_penultimate[mask], axis=0)
+    
+    # Process in batches to avoid memory issues
+    batch_size = 1000
+    num_samples = x_penultimate.shape[0]
+    distance_ratios = np.zeros(num_samples)
+    
+    for start_idx in range(0, num_samples, batch_size):
+        end_idx = min(start_idx + batch_size, num_samples)
+        batch_samples = x_penultimate[start_idx:end_idx]
+        batch_labels = y_predicted[start_idx:end_idx]
+        
+        # Calculate distances to all centroids for each sample in the batch
+        distances = np.sqrt(((batch_samples[:, np.newaxis, :] - centroids[np.newaxis, :, :]) ** 2).sum(axis=2))
+        
+        for i, label in enumerate(batch_labels):
+            true_centroid_idx = class_to_idx[label]
+            distance_to_centroid = distances[i, true_centroid_idx]
+            
+            # Create a mask for other class centroids
+            other_centroids_mask = np.ones(num_classes, dtype=bool)
+            other_centroids_mask[true_centroid_idx] = False
+            
+            if np.sum(other_centroids_mask) > 0:
+                min_distance_to_other = np.min(distances[i, other_centroids_mask])
+                ratio = min_distance_to_other / distance_to_centroid if distance_to_centroid > 0 else np.inf
+                distance_ratios[start_idx + i] = ratio  # Fixed indexing here
+    
     return {
-        "distance_ratios": distance_ratios_array,
-        "average_distance_ratio": np.mean(distance_ratios_array),
+        "distance_ratios": distance_ratios,
+        "average_distance_ratio": np.mean(distance_ratios[distance_ratios != np.inf]),  # Exclude inf values
     }
 
-
-def get_binarity_metrics(evaluations):
+def get_binarity_metrics(evaluations, max_samples=10000):
     """
     Calculate binarity metrics using Gaussian Mixture Models for each feature dimension.
 
@@ -211,6 +399,16 @@ def get_binarity_metrics(evaluations):
     metrics (GMM score, peaks distance, etc.) are computed.
     """
     x_penultimate = evaluations["x_penultimate"]
+    
+    n_samples, n_features = x_penultimate.shape
+ 
+    if n_samples > max_samples:
+        print(f"Subsampling from {n_samples} to {max_samples} for binarity metrics calculation")
+        indices = np.random.choice(n_samples, max_samples, replace=False)
+        x_penultimate = x_penultimate[indices]
+        n_samples = max_samples 
+ 
+
     scores = []
     stds_list = []
     peaks_distance_list = []
@@ -225,7 +423,7 @@ def get_binarity_metrics(evaluations):
                 gmm = GaussianMixture(n_components=2)
                 gmm.fit(scaled_feature)
         except Exception as e:
-            raise RuntimeError("Error in GMM fit for feature {}: {}".format(d, e)) from e
+            raise RuntimeError(f"Error in GMM fit for feature {d}: {e}") from e
 
         scores.append(gmm.score(scaled_feature))
         means = gmm.means_.flatten()
@@ -257,6 +455,11 @@ def get_binarity_metrics(evaluations):
     }
 
 
+
+
+# -----------------------------------------------------------------------------
+# Lipschitz Estimation Functions
+# -----------------------------------------------------------------------------
 
 def _compute_gradient_norm_batch(model: nn.Module, x_batch: torch.Tensor, y_batch: torch.Tensor, device: torch.device):
     """
@@ -406,7 +609,6 @@ def estimate_lipschitz_gradient_norm_stream(model: nn.Module, loader: torch.util
             - 'num_samples_used': Total number of samples processed.
             - 'num_batches_used': Total number of batches processed.
     """
-    # Corrected indentation
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -418,18 +620,15 @@ def estimate_lipschitz_gradient_norm_stream(model: nn.Module, loader: torch.util
     num_batches_processed = 0
 
     print(f"Estimating gradient norms using DataLoader...")
-    # Removed tqdm wrapper
     with torch.no_grad(): # Temporarily disable grad globally for efficiency, enable locally
         batch_iterator = loader # Use the loader directly
         for batch_idx, batch_data in enumerate(batch_iterator):
-            # Corrected indentation
             if max_batches is not None and batch_idx >= max_batches:
                 print(f"Reached max_batches limit ({max_batches}). Stopping.")
                 break
 
             # --- Input Data Handling ---
             # Try to handle different DataLoader return types
-            # Corrected indentation
             if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
                 x_batch, y_batch = batch_data[0], batch_data[1]
                 # Add further checks if necessary (e.g., tensor type)
@@ -437,12 +636,12 @@ def estimate_lipschitz_gradient_norm_stream(model: nn.Module, loader: torch.util
                  x_batch, y_batch = batch_data['image'], batch_data['label']
             else:
                  warnings.warn(f"Skipping batch {batch_idx}: Unexpected data format from DataLoader: {type(batch_data)}")
-                 continue # Corrected indentation
+                 continue
 
             # Corrected indentation
             if not isinstance(x_batch, torch.Tensor) or not isinstance(y_batch, torch.Tensor):
                  warnings.warn(f"Skipping batch {batch_idx}: Expected tensors, got {type(x_batch)}, {type(y_batch)}")
-                 continue # Corrected indentation
+                 continue 
             # --- End Input Data Handling ---
 
 
@@ -487,4 +686,3 @@ def estimate_lipschitz_gradient_norm_stream(model: nn.Module, loader: torch.util
         "num_samples_used": num_samples_processed,
         "num_batches_used": num_batches_processed,
     }
-

@@ -1,9 +1,4 @@
 #!/usr/bin/env python3
-"""
-Utility to generate and submit the grid of CIFAR SLURM jobs used in the LPC paper.
-Creates per-run directories, copies the configuration file for traceability,
-and schedules all architecture/learning-rate combinations.
-"""
 import argparse
 import shutil
 import subprocess
@@ -40,7 +35,7 @@ echo "MASTER_PORT: $MASTER_PORT"
 echo "MASTER_ADDR: $SLURM_LAUNCH_NODE_IPADDR"
 
 srun -N "$SLURM_JOB_NUM_NODES" --cpu-bind=verbose \
-  /bin/bash -c "torchrun --nnodes=\$SLURM_JOB_NUM_NODES --nproc-per-node=\$SLURM_GPUS_ON_NODE --master-addr=\$SLURM_LAUNCH_NODE_IPADDR --master-port=\"$MASTER_PORT\" --start-method=forkserver --node-rank=\$SLURM_NODEID  ${model_script} --config  ${config}  --lr ${lr} --store-penultimate ${store_penultimate} --results-dir ${results_dir}/${id_name}/${k_dir}  --dataset-dir ${dataset_dir} --sample ${i_lr}"
+  /bin/bash -c "torchrun --nnodes=\$SLURM_JOB_NUM_NODES --nproc-per-node=\$SLURM_GPUS_ON_NODE --master-addr=\$SLURM_LAUNCH_NODE_IPADDR --master-port=\"$MASTER_PORT\" --start-method=forkserver --node-rank=\$SLURM_NODEID  ${model_script} --config  ${config}  --lr ${lr} --weight-decay ${weight_decay} --store-penultimate ${store_penultimate} --results-dir ${results_dir}/${id_name}/${k_dir}  --dataset-dir ${dataset_dir} --sample ${i_lr}"
 """
 
 def create_replace_directory(dir_path: Path) -> None:
@@ -101,16 +96,7 @@ def submit_slurm_jobs(template: str, config: str, id_name: str, dataset_dir: str
     
     # Define job configurations for each architecture variant.
     job_variants = [
-        ("lpc", f"{script_path / 'main.py'} --architecture-type lin_pen --l2-loss True"),
-        ("lpc_wide", f"{script_path / 'main.py'} --architecture-type lin_pen --l2-loss True --penultimate-nodes wide"),
-        ("lpc_narrow", f"{script_path / 'main.py'} --architecture-type lin_pen --l2-loss True --penultimate-nodes narrow"),
-        ("lpc_scl", f"{script_path / 'main.py'} --architecture-type lin_pen --l2-loss True --scl True"),
-        ("lpc_no_pen", f"{script_path / 'main.py'} --architecture-type no_pen --l2-loss True"),
-        ("no_pen_scl", f"{script_path / 'main.py'} --architecture-type no_pen --scl True"),
         ("no_pen", f"{script_path / 'main.py'} --architecture-type no_pen"),
-        ("no_pen_arcface", f"{script_path / 'main.py'} --architecture-type no_pen --arcface True"),
-        ("lin_pen", f"{script_path / 'main.py'} --architecture-type lin_pen"),
-        ("nonlin_pen", f"{script_path / 'main.py'} --architecture-type nonlin_pen")
     ]
 
     for k in [1,2,3,4,5]:
@@ -141,6 +127,7 @@ def submit_slurm_jobs(template: str, config: str, id_name: str, dataset_dir: str
                     "job_name": job_name,
                     "config": config_to_use,  # Use the copied config path
                     "lr": str(lr),
+                    "weight_decay": 0.1,
                     "results_dir": results_dir,
                     "id_name": id_name,
                     "dataset_dir": dataset_dir,
@@ -175,11 +162,12 @@ def main():
     args = parse_args()
 
     store_penultimate = str(args.store_penultimate)
+    id_name = "wd1_" + args.id_name
     
     submit_slurm_jobs(
         template=TEMPLATE_JOB,
         config=args.config,
-        id_name=args.id_name,
+        id_name=id_name,
         dataset_dir=args.dataset_dir,
         results_dir=args.results_dir,
         output_dir=args.output_dir,
